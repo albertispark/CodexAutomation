@@ -24,11 +24,14 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("PIPELINE_CONFIG", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = {
         "paths": {"inputs": "inputs", "outputs": "outputs", "cache": "cache", "logs": "logs"},
+        "review": {"enabled": False},
         "redaction": {
             "enabled": True,
             "patterns": {

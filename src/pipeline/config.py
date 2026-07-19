@@ -37,6 +37,17 @@ class CloudConfig(BaseModel):
     base_url: str | None = None
 
 
+class PeerReviewConfig(BaseModel):
+    """Independent OpenAI review; credentials are environment-owned."""
+
+    enabled: bool = False
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = "medium"
+    max_output_tokens: int = Field(default=12000, ge=1024, le=128000)
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+
+
 class IndexConfig(BaseModel):
     """Chunking and vector index configuration."""
 
@@ -105,8 +116,16 @@ class PathsConfig(BaseModel):
         return self.cache / "cloud"
 
     @property
+    def review_cache(self) -> Path:
+        return self.cache / "review"
+
+    @property
     def quarantine_dir(self) -> Path:
         return self.outputs / "quarantine"
+
+    @property
+    def review_dir(self) -> Path:
+        return self.outputs / "reviews"
 
     @property
     def batches_dir(self) -> Path:
@@ -117,11 +136,13 @@ class PathsConfig(BaseModel):
             self.inputs,
             self.outputs,
             self.quarantine_dir,
+            self.review_dir,
             self.batches_dir,
             self.ocr_cache,
             self.index_cache,
             self.bouncer_cache,
             self.cloud_cache,
+            self.review_cache,
             self.logs,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -132,6 +153,7 @@ class Settings(BaseModel):
 
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
+    review: PeerReviewConfig = Field(default_factory=PeerReviewConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)
@@ -156,12 +178,15 @@ def _resolve_config_path(path: str | Path | None) -> Path:
 def load_settings(path: str | Path | None = None) -> Settings:
     """Load YAML, merge approved environment overrides, resolve paths, and mkdir."""
 
-    # PIPELINE_CONFIG itself is allowed in the project .env, so dotenv must
-    # run before the resolution chain. Explicit ``path`` still wins below.
+    # PIPELINE_CONFIG itself is allowed in the project dotenv files, so they
+    # must run before the resolution chain. .env.local has higher priority
+    # because both loads preserve variables that are already set.
     if path is None:
+        load_dotenv(Path(".env.local"), override=False)
         load_dotenv(Path(".env"), override=False)
     config_path = _resolve_config_path(path)
     repo_root = config_path.parent.parent
+    load_dotenv(repo_root / ".env.local", override=False)
     load_dotenv(repo_root / ".env", override=False)
 
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -174,6 +199,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
     # These fields are environment-owned even if somebody accidentally puts
     # them in YAML; never retain a YAML secret or gateway value.
     cloud["base_url"] = os.environ.get("ANTHROPIC_BASE_URL") or None
+    review = raw.setdefault("review", {})
+    review["api_key"] = os.environ.get("OPENAI_API_KEY") or None
+    review["base_url"] = os.environ.get("OPENAI_BASE_URL") or None
     ollama_host = os.environ.get("OLLAMA_HOST")
     if ollama_host:
         raw.setdefault("ollama", {})["host"] = ollama_host

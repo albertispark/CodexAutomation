@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "ollama",
     "anthropic",
+    "openai>=1.66.0",
     "pydantic>=2",
     "pandas",
     "openpyxl",

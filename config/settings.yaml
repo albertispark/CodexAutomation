@@ -1,5 +1,5 @@
 # Financial Data Pipeline — runtime configuration.
-# Secrets NEVER live here; they come from .env / environment.
+# Secrets NEVER live here; they come from .env.local / environment.
 ollama:
   host: "http://localhost:11434"
   ocr_model: "gemma4:e4b"
@@ -13,6 +13,12 @@ cloud:
   max_tokens: 8000
   enable_prompt_caching: true
   monthly_budget_usd: 25.0
+
+review:
+  enabled: true
+  model: "gpt-5.6-sol"
+  reasoning_effort: "medium"
+  max_output_tokens: 12000
 
 index:
   backend: "numpy"

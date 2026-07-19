@@ -37,6 +37,15 @@ from pipeline.cloud.claude_client import (
     ClaudeClient,
     CloudRefusalError,
 )
+from pipeline.cloud.openai_reviewer import (
+    REVIEW_PROMPT_VERSION,
+    OpenAIReviewer,
+    PeerReviewRefusalError,
+    PeerReviewResult,
+    ReviewUsage,
+    build_review_user_message,
+    validate_peer_review,
+)
 from pipeline.config import Settings
 from pipeline.extraction.bouncer import (
     DEFAULT_RETRIEVAL_QUERIES,
@@ -109,6 +118,8 @@ class PipelineResult:
     payload_tokens: int = 0
     payload_sha256: str | None = None
     request_sha256: str | None = None
+    review_request_sha256: str | None = None
+    review_verdict: str | None = None
     redaction_hits: dict[str, int] = field(default_factory=dict)
     audit_written: bool = False
 
@@ -349,6 +360,136 @@ def _write_cloud_cache(
     )
 
 
+def _review_request_sha256(
+    redacted: RedactedPayload,
+    analysis: AnalysisResult,
+    settings: Settings,
+    tasks: list[str],
+) -> str:
+    request = build_review_user_message(redacted, tasks, analysis)
+    material = json.dumps(
+        {
+            "request": request,
+            "model": settings.review.model,
+            "reasoning_effort": settings.review.reasoning_effort,
+            "max_output_tokens": settings.review.max_output_tokens,
+            "prompt_version": REVIEW_PROMPT_VERSION,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _review_cache_path(settings: Settings, request_sha: str) -> Path:
+    return settings.paths.review_cache / f"{request_sha}.json"
+
+
+def _read_review_cache(
+    settings: Settings,
+    request_sha: str,
+    tasks: list[str],
+) -> PeerReviewResult | None:
+    try:
+        data = json.loads(
+            _review_cache_path(settings, request_sha).read_text(encoding="utf-8")
+        )
+        if (
+            data.get("tasks") != tasks
+            or data.get("model") != settings.review.model
+            or data.get("reasoning_effort") != settings.review.reasoning_effort
+            or data.get("prompt_version") != REVIEW_PROMPT_VERSION
+        ):
+            return None
+        return PeerReviewResult.model_validate(data["result"])
+    except (OSError, ValueError, TypeError, KeyError, ValidationError):
+        return None
+
+
+def _write_review_cache(
+    settings: Settings,
+    request_sha: str,
+    review: PeerReviewResult,
+    tasks: list[str],
+) -> Path:
+    return _atomic_json(
+        _review_cache_path(settings, request_sha),
+        {
+            "result": review.model_dump(mode="json"),
+            "tasks": tasks,
+            "model": settings.review.model,
+            "reasoning_effort": settings.review.reasoning_effort,
+            "prompt_version": REVIEW_PROMPT_VERSION,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _merge_token_usage(current: TokenUsage, usage: ReviewUsage) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=current.input_tokens + usage.input_tokens,
+        output_tokens=current.output_tokens + usage.output_tokens,
+        cache_read_input_tokens=(
+            current.cache_read_input_tokens + usage.cache_read_input_tokens
+        ),
+        cache_creation_input_tokens=(
+            current.cache_creation_input_tokens + usage.cache_creation_input_tokens
+        ),
+        # OpenAI model pricing is not hardcoded here. The existing estimate is
+        # the Anthropic amount recorded by its budget ledger.
+        estimated_cost_usd=current.estimated_cost_usd,
+    )
+
+
+def _apply_review_result(
+    ctx: _FileCtx,
+    review: PeerReviewResult,
+    original: AnalysisResult,
+    settings: Settings,
+    *,
+    cache_hit: bool,
+) -> None:
+    if ctx.redacted is None or ctx.result.review_request_sha256 is None:
+        raise RuntimeError("review context is incomplete")
+    validate_peer_review(review, original, ctx.redacted)
+    destination = settings.paths.review_dir / (
+        f"{ctx.path.stem}.{ctx.sha256[:12]}.review.json"
+    )
+    _atomic_json(
+        destination,
+        {
+            "review_request_sha256": ctx.result.review_request_sha256,
+            "review_prompt_version": REVIEW_PROMPT_VERSION,
+            "claude_model": settings.cloud.model,
+            "review_model": settings.review.model,
+            "verdict": review.verdict,
+            "issues": [issue.model_dump(mode="json") for issue in review.issues],
+            "claude_analysis": original.model_dump(mode="json"),
+            "reviewed_analysis": review.reviewed_analysis.model_dump(mode="json"),
+            "cache_hit": cache_hit,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+        pretty=True,
+    )
+    ctx.result.artifacts["review_json"] = destination.resolve()
+    ctx.result.review_verdict = review.verdict
+    ctx.result.stages_run.append("review")
+    if review.verdict == "rejected":
+        _quarantine(
+            ctx,
+            "review",
+            "openai_peer_review_rejected",
+            settings,
+            {
+                "review_artifact": str(destination.resolve()),
+                "issues": [issue.model_dump(mode="json") for issue in review.issues],
+            },
+        )
+        return
+    ctx.analysis = review.reviewed_analysis
+
+
 def _usage_from_sdk(usage: Any, cost: float) -> TokenUsage:
     def counter(name: str) -> int:
         if isinstance(usage, dict):
@@ -379,18 +520,21 @@ def _audit_context(
         reduction = 1.0 - (
             ctx.result.payload_tokens / ctx.result.raw_tokens_est
         )
+    models_used = {
+        "ocr": settings.ollama.ocr_model,
+        "extract": settings.ollama.extract_model,
+        "embed": settings.ollama.embed_model,
+        "cloud": settings.cloud.model,
+    }
+    if settings.review.enabled:
+        models_used["review"] = settings.review.model
     record = AuditRecord(
         run_id=run_id,
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         input_file=str(ctx.path.resolve()),
         input_sha256=ctx.sha256,
         stages_run=list(ctx.result.stages_run),
-        models_used={
-            "ocr": settings.ollama.ocr_model,
-            "extract": settings.ollama.extract_model,
-            "embed": settings.ollama.embed_model,
-            "cloud": settings.cloud.model,
-        },
+        models_used=models_used,
         token_usage=AuditTokenUsage(
             input_tokens=ctx.result.token_usage.input_tokens,
             output_tokens=ctx.result.token_usage.output_tokens,
@@ -586,7 +730,7 @@ def run_pipeline(
     batch: bool = False,
     console: Console | None = None,
 ) -> list[PipelineResult]:
-    """Execute all five stages in stage-major order across every input."""
+    """Execute all six stages in stage-major order across every input."""
     console = console or Console()
     run_id = uuid.uuid4().hex
     audit = AuditLog(settings.paths.logs)
@@ -610,12 +754,13 @@ def run_pipeline(
     ):
         total_files = len(input_paths)
         ingest_progress = progress.add_task(
-            "[1/5] OCR / Parse", total=total_files
+            "[1/6] OCR / Parse", total=total_files
         )
-        index_progress = progress.add_task("[2/5] Index", total=total_files)
-        bounce_progress = progress.add_task("[3/5] Bouncer", total=total_files)
-        cloud_progress = progress.add_task("[4/5] Claude", total=total_files)
-        excel_progress = progress.add_task("[5/5] Excel", total=total_files)
+        index_progress = progress.add_task("[2/6] Index", total=total_files)
+        bounce_progress = progress.add_task("[3/6] Bouncer", total=total_files)
+        cloud_progress = progress.add_task("[4/6] Claude", total=total_files)
+        review_progress = progress.add_task("[5/6] OpenAI review", total=total_files)
+        excel_progress = progress.add_task("[6/6] Excel", total=total_files)
 
         # A4 plan-first: no daemon call and no model load during this pass.
         for path in input_paths:
@@ -674,7 +819,7 @@ def run_pipeline(
             for ctx in ctxs:
                 progress.update(
                     ingest_progress,
-                    description=f"[1/5] OCR / Parse {ctx.path.name}",
+                    description=f"[1/6] OCR / Parse {ctx.path.name}",
                 )
                 if not ctx.active or ctx.plan is None:
                     progress.advance(ingest_progress)
@@ -730,7 +875,7 @@ def run_pipeline(
                     progress.advance(ingest_progress)
             progress.update(
                 ingest_progress,
-                description="[1/5] OCR / Parse",
+                description="[1/6] OCR / Parse",
                 completed=total_files,
             )
 
@@ -772,7 +917,7 @@ def run_pipeline(
             for ctx in ctxs:
                 progress.update(
                     index_progress,
-                    description=f"[2/5] Index {ctx.path.name}",
+                    description=f"[2/6] Index {ctx.path.name}",
                 )
                 if (
                     not ctx.active
@@ -809,7 +954,7 @@ def run_pipeline(
                     progress.advance(index_progress)
             progress.update(
                 index_progress,
-                description="[2/5] Index",
+                description="[2/6] Index",
                 completed=total_files,
             )
 
@@ -850,7 +995,7 @@ def run_pipeline(
             for ctx in ctxs:
                 progress.update(
                     bounce_progress,
-                    description=f"[3/5] Bouncer {ctx.path.name}",
+                    description=f"[3/6] Bouncer {ctx.path.name}",
                 )
                 if not ctx.active or ctx.ingested is None:
                     progress.advance(bounce_progress)
@@ -909,7 +1054,7 @@ def run_pipeline(
                     progress.advance(bounce_progress)
             progress.update(
                 bounce_progress,
-                description="[3/5] Bouncer",
+                description="[3/6] Bouncer",
                 completed=total_files,
             )
 
@@ -944,6 +1089,7 @@ def run_pipeline(
                     f"ceiling≈${estimate:.6f}"
                 )
             progress.update(cloud_progress, completed=total_files)
+            progress.update(review_progress, completed=total_files)
             progress.update(excel_progress, completed=total_files)
             _audit_all(ctxs, settings, run_id, audit)
             return [ctx.result for ctx in ctxs]
@@ -959,6 +1105,7 @@ def run_pipeline(
                         raise
                     _mark_failed(ctx, error, "payload_write_failed")
             progress.update(cloud_progress, completed=total_files)
+            progress.update(review_progress, completed=total_files)
             progress.update(excel_progress, completed=total_files)
             _audit_all(ctxs, settings, run_id, audit)
             return [ctx.result for ctx in ctxs]
@@ -1067,7 +1214,7 @@ def run_pipeline(
             for ctx in cloud_misses:
                 progress.update(
                     cloud_progress,
-                    description=f"[4/5] Claude {ctx.path.name}",
+                    description=f"[4/6] Claude {ctx.path.name}",
                 )
                 started = time.monotonic()
                 if budget_stopped:
@@ -1143,15 +1290,101 @@ def run_pipeline(
 
         progress.update(
             cloud_progress,
-            description="[4/5] Claude",
+            description="[4/6] Claude",
             completed=total_files,
         )
 
-        # ------------------------------- Stage E: workbook then audit
+        # ------------------------------- Stage E: independent OpenAI review
+        reviewer: OpenAIReviewer | None = None
+        for ctx in ctxs:
+            progress.update(
+                review_progress,
+                description=f"[5/6] OpenAI review {ctx.path.name}",
+            )
+            if (
+                not settings.review.enabled
+                or not ctx.active
+                or ctx.analysis is None
+                or ctx.redacted is None
+            ):
+                progress.advance(review_progress)
+                continue
+            started = time.monotonic()
+            original = ctx.analysis
+            try:
+                review_sha = _review_request_sha256(
+                    ctx.redacted, original, settings, tasks
+                )
+                ctx.result.review_request_sha256 = review_sha
+                reviewed = _read_review_cache(settings, review_sha, tasks)
+                cache_hit = reviewed is not None
+                if reviewed is None:
+                    if settings.review.api_key is None:
+                        _environment_abort(
+                            ctxs,
+                            settings,
+                            run_id,
+                            audit,
+                            "openai_api_key_missing",
+                        )
+                        raise PipelineEnvironmentError(
+                            "OPENAI_API_KEY is not set; add it to .env.local or "
+                            "set review.enabled=false"
+                        )
+                    if reviewer is None:
+                        try:
+                            reviewer = OpenAIReviewer(settings)
+                        except Exception as error:
+                            _environment_abort(
+                                ctxs,
+                                settings,
+                                run_id,
+                                audit,
+                                "review_client_initialization",
+                            )
+                            raise PipelineEnvironmentError(
+                                "OpenAI review client initialization failed"
+                            ) from error
+                    reviewed, review_usage = reviewer.review(
+                        ctx.redacted, tasks, original
+                    )
+                    validate_peer_review(reviewed, original, ctx.redacted)
+                    ctx.result.token_usage = _merge_token_usage(
+                        ctx.result.token_usage, review_usage
+                    )
+                    _write_review_cache(settings, review_sha, reviewed, tasks)
+                _apply_review_result(
+                    ctx,
+                    reviewed,
+                    original,
+                    settings,
+                    cache_hit=cache_hit,
+                )
+            except PipelineEnvironmentError:
+                raise
+            except PeerReviewRefusalError:
+                _quarantine(ctx, "review", "openai_peer_review_refusal", settings)
+                ctx.result.status = "refused"
+                ctx.result.error = "PeerReviewRefusalError: openai_peer_review_refusal"
+            except Exception as error:
+                if _is_disk_full(error):
+                    raise
+                _mark_failed(ctx, error, "openai_peer_review_failed")
+            finally:
+                ctx.result.timings["review"] = time.monotonic() - started
+                progress.advance(review_progress)
+
+        progress.update(
+            review_progress,
+            description="[5/6] OpenAI review",
+            completed=total_files,
+        )
+
+        # ------------------------------- Stage F: workbook then audit
         for ctx in ctxs:
             progress.update(
                 excel_progress,
-                description=f"[5/5] Excel {ctx.path.name}",
+                description=f"[6/6] Excel {ctx.path.name}",
             )
             if not ctx.active or ctx.analysis is None or ctx.redacted is None:
                 progress.advance(excel_progress)
@@ -1174,7 +1407,7 @@ def run_pipeline(
 
         progress.update(
             excel_progress,
-            description="[5/5] Excel",
+            description="[6/6] Excel",
             completed=total_files,
         )
 
@@ -1239,6 +1472,7 @@ def poll_batch(
         if settings.cloud.api_key is None:
             raise PipelineEnvironmentError("ANTHROPIC_API_KEY is required for batch-poll")
         client = ClaudeClient(settings)
+        reviewer: OpenAIReviewer | None = None
         while True:
             state = client.retrieve_batch(batch_id)
             status = _field(state, "processing_status")
@@ -1303,12 +1537,57 @@ def poll_batch(
                             ctx.result.payload_tokens,
                             job["tasks"],
                         )
-                        destination = settings.paths.outputs / output_filename(
-                            path.stem, ctx.sha256[:12]
-                        )
-                        write_workbook(ctx.analysis, ctx.redacted.payload, destination)
-                        ctx.result.artifacts["xlsx"] = destination.resolve()
-                        ctx.result.stages_run.append("excel")
+                        if settings.review.enabled:
+                            original = ctx.analysis
+                            review_sha = _review_request_sha256(
+                                ctx.redacted, original, settings, job["tasks"]
+                            )
+                            ctx.result.review_request_sha256 = review_sha
+                            reviewed = _read_review_cache(
+                                settings, review_sha, job["tasks"]
+                            )
+                            cache_hit = reviewed is not None
+                            if reviewed is None:
+                                if settings.review.api_key is None:
+                                    raise PipelineEnvironmentError(
+                                        "OPENAI_API_KEY is required to peer-review "
+                                        "completed batch results"
+                                    )
+                                if reviewer is None:
+                                    try:
+                                        reviewer = OpenAIReviewer(settings)
+                                    except Exception as error:
+                                        raise PipelineEnvironmentError(
+                                            "OpenAI review client initialization failed"
+                                        ) from error
+                                reviewed, review_usage = reviewer.review(
+                                    ctx.redacted, job["tasks"], original
+                                )
+                                validate_peer_review(
+                                    reviewed, original, ctx.redacted
+                                )
+                                ctx.result.token_usage = _merge_token_usage(
+                                    ctx.result.token_usage, review_usage
+                                )
+                                _write_review_cache(
+                                    settings, review_sha, reviewed, job["tasks"]
+                                )
+                            _apply_review_result(
+                                ctx,
+                                reviewed,
+                                original,
+                                settings,
+                                cache_hit=cache_hit,
+                            )
+                        if ctx.active:
+                            destination = settings.paths.outputs / output_filename(
+                                path.stem, ctx.sha256[:12]
+                            )
+                            write_workbook(
+                                ctx.analysis, ctx.redacted.payload, destination
+                            )
+                            ctx.result.artifacts["xlsx"] = destination.resolve()
+                            ctx.result.stages_run.append("excel")
                     elif stop_reason == "refusal":
                         _quarantine(ctx, "cloud", "cloud_refusal", settings)
                         ctx.result.status = "refused"
@@ -1327,6 +1606,16 @@ def poll_batch(
                     )
                 else:
                     _mark_failed(ctx, "BatchResult", "batch_unknown_result")
+            except PeerReviewRefusalError:
+                _quarantine(
+                    ctx, "review", "openai_peer_review_refusal", settings
+                )
+                ctx.result.status = "refused"
+                ctx.result.error = (
+                    "PeerReviewRefusalError: openai_peer_review_refusal"
+                )
+            except PipelineEnvironmentError:
+                raise
             except OSError as error:
                 if _is_disk_full(error):
                     raise

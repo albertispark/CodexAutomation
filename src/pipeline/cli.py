@@ -130,7 +130,7 @@ def run(
         help="Explicit consent required for a run when redaction.enabled=false.",
     ),
 ) -> None:
-    """Run the five-stage pipeline.
+    """Run the six-stage pipeline.
 
     Exit codes: 0 = all success (batch_pending counts as submitted success),
     1 = a file failed/quarantined/budget-stopped/refused, 2 = environment error.
@@ -261,10 +261,22 @@ def doctor() -> None:
 
     if settings.cloud.api_key:
         gateway = f" via {settings.cloud.base_url}" if settings.cloud.base_url else ""
-        table.add_row("5. API key", "PASS", f"configured{gateway}")
+        table.add_row("5. Anthropic key", "PASS", f"configured{gateway}")
     else:
         table.add_row(
-            "5. API key", "WARN", "Set ANTHROPIC_API_KEY or use --no-cloud"
+            "5. Anthropic key", "WARN", "Set ANTHROPIC_API_KEY or use --no-cloud"
+        )
+
+    if not settings.review.enabled:
+        table.add_row("6. OpenAI key", "PASS", "peer review disabled")
+    elif settings.review.api_key:
+        gateway = f" via {settings.review.base_url}" if settings.review.base_url else ""
+        table.add_row("6. OpenAI key", "PASS", f"configured{gateway}")
+    else:
+        table.add_row(
+            "6. OpenAI key",
+            "WARN",
+            "Set OPENAI_API_KEY or set review.enabled=false",
         )
 
     writable = [
@@ -280,17 +292,17 @@ def doctor() -> None:
             probe.unlink()
         except OSError as error:
             failed = True
-            table.add_row("6. Dirs writable", "FAIL", f"{directory}: {error}")
+            table.add_row("7. Dirs writable", "FAIL", f"{directory}: {error}")
             break
     else:
-        table.add_row("6. Dirs writable", "PASS", "inputs/ outputs/ cache/ logs/")
+        table.add_row("7. Dirs writable", "PASS", "inputs/ outputs/ cache/ logs/")
 
     free = shutil.disk_usage(settings.paths.cache).free
     if free >= 2 * 1024**3:
-        table.add_row("7. Disk space", "PASS", f"{free / 1024**3:.1f} GiB free")
+        table.add_row("8. Disk space", "PASS", f"{free / 1024**3:.1f} GiB free")
     else:
         failed = True
-        table.add_row("7. Disk space", "FAIL", "free at least 2 GiB on cache volume")
+        table.add_row("8. Disk space", "FAIL", "free at least 2 GiB on cache volume")
 
     console.print(table)
     raise typer.Exit(2 if failed else 0)
