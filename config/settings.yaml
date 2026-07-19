@@ -1,0 +1,36 @@
+# Financial Data Pipeline — runtime configuration.
+# Secrets NEVER live here; they come from .env / environment.
+ollama:
+  host: "http://localhost:11434"
+  ocr_model: "gemma4:e4b"
+  extract_model: "qwen3:8b"
+  embed_model: "nomic-embed-text"
+  keep_alive: "5m"
+  num_ctx: 8192
+
+cloud:
+  model: "claude-opus-4-8"
+  max_tokens: 8000
+  enable_prompt_caching: true
+  monthly_budget_usd: 25.0
+
+index:
+  backend: "numpy"
+  chunk_tokens: 512
+  chunk_overlap: 64
+  top_k: 8
+
+pipeline:
+  scanned_page_min_chars: 32
+  max_file_mb: 50
+
+paths:
+  inputs: "inputs"
+  outputs: "outputs"
+  cache: "cache"
+  logs: "logs"
+
+redaction:
+  enabled: true
+  patterns:
+    us_phone: '\b(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}\b'

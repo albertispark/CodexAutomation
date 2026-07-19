@@ -1,0 +1,14 @@
+{
+  "adjustments": [],
+  "computed_metrics": [
+    {
+      "formula_used": "operating_income / revenue",
+      "inputs": ["F0001", "F0002"],
+      "name": "Operating Margin",
+      "period": "FY2025",
+      "value": 0.2
+    }
+  ],
+  "data_quality_flags": [],
+  "variance_analysis": []
+}

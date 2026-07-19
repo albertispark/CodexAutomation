@@ -1,0 +1,19 @@
+{
+  "company": "Acme",
+  "currency_default": "USD",
+  "doc_type": "annual report",
+  "figures": [
+    {
+      "currency": "USD",
+      "label": "Revenue",
+      "period": "FY2025",
+      "source_page": 1,
+      "statement": "income_statement",
+      "unit": "thousands",
+      "value": 1250.0,
+      "verbatim_context": "Revenue 1,250"
+    }
+  ],
+  "periods": ["FY2025"],
+  "warnings": []
+}

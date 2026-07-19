@@ -1,0 +1,164 @@
+{
+  "$defs": {
+    "FinancialFigure": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "ISO-4217 code if stated, else null.",
+          "title": "Currency"
+        },
+        "figure_id": {
+          "default": "",
+          "description": "Stable id 'F0001', 'F0002', ... assigned by the Bouncer after validation; never emitted by the local model.",
+          "title": "Figure Id",
+          "type": "string"
+        },
+        "label": {
+          "description": "Line-item name exactly as printed.",
+          "title": "Label",
+          "type": "string"
+        },
+        "period": {
+          "description": "Reporting period exactly as labeled.",
+          "title": "Period",
+          "type": "string"
+        },
+        "source_page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "1-based source page or sheet ordinal, null if unknown.",
+          "title": "Source Page"
+        },
+        "statement": {
+          "$ref": "#/$defs/StatementType",
+          "description": "Financial statement classification."
+        },
+        "unit": {
+          "description": "One of: absolute, thousands, millions, billions, percent, ratio, shares.",
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Number copied verbatim with symbols/separators stripped and parentheses interpreted as negative; null if unreadable.",
+          "title": "Value"
+        },
+        "verbatim_context": {
+          "description": "Exact local-only source snippet containing the figure; excluded from all outbound serialization.",
+          "maxLength": 200,
+          "title": "Verbatim Context",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "value",
+        "unit",
+        "currency",
+        "period",
+        "statement",
+        "source_page",
+        "verbatim_context"
+      ],
+      "title": "FinancialFigure",
+      "type": "object"
+    },
+    "StatementType": {
+      "enum": [
+        "income_statement",
+        "balance_sheet",
+        "cash_flow",
+        "other"
+      ],
+      "title": "StatementType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "company": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Company name as printed, or null.",
+      "title": "Company"
+    },
+    "currency_default": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Document-wide ISO-4217 currency, or null.",
+      "title": "Currency Default"
+    },
+    "doc_type": {
+      "description": "Document type, or unknown.",
+      "title": "Doc Type",
+      "type": "string"
+    },
+    "figures": {
+      "description": "Every raw figure found.",
+      "items": {
+        "$ref": "#/$defs/FinancialFigure"
+      },
+      "title": "Figures",
+      "type": "array"
+    },
+    "periods": {
+      "description": "All distinct reporting periods found.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Periods",
+      "type": "array"
+    },
+    "warnings": {
+      "description": "Extraction ambiguities or OCR warnings.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "company",
+    "doc_type",
+    "currency_default",
+    "periods",
+    "figures",
+    "warnings"
+  ],
+  "title": "ExtractionPayload",
+  "type": "object"
+}

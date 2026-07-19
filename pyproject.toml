@@ -1,0 +1,41 @@
+[project]
+name = "financial-pipeline"
+version = "0.1.0"
+description = "Hybrid local and cloud automated financial data pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ollama",
+    "anthropic",
+    "pydantic>=2",
+    "pandas",
+    "openpyxl",
+    "pymupdf",
+    "numpy",
+    "tenacity",
+    "typer",
+    "rich",
+    "python-dotenv",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+faiss = ["faiss-cpu"]
+dev = ["pytest"]
+
+[project.scripts]
+pipeline = "pipeline.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires a locally running Ollama daemon",
+    "anthropic_integration: requires an Anthropic API key",
+]
