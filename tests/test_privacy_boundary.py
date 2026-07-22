@@ -10,6 +10,7 @@ from rich.console import Console
 
 from pipeline.cloud.analysis import build_user_message
 from pipeline.cloud.claude_client import ClaudeClient
+from pipeline.cloud.openai_reviewer import OpenAIReviewer, build_review_user_message
 from pipeline.extraction.bouncer import Bouncer
 from pipeline.extraction.schemas import ExtractionPayload, FinancialFigure, StatementType
 from pipeline.indexing.embedder import Embedder
@@ -39,17 +40,33 @@ def test_only_claude_client_imports_anthropic() -> None:
     assert importers == ["cloud/claude_client.py"]
 
 
+def test_only_openai_reviewer_imports_openai() -> None:
+    importers = []
+    for path in SRC.rglob("*.py"):
+        if any(name == "openai" or name.startswith("openai.") for name in _imports(path)):
+            importers.append(path.relative_to(SRC).as_posix())
+    assert importers == ["cloud/openai_reviewer.py"]
+
+
 def test_cloud_client_has_no_ingestion_or_indexing_imports() -> None:
     imports = _imports(SRC / "cloud" / "claude_client.py")
     assert not any(name.startswith("pipeline.ingestion") for name in imports)
     assert not any(name.startswith("pipeline.indexing") for name in imports)
 
+    review_imports = _imports(SRC / "cloud" / "openai_reviewer.py")
+    assert not any(name.startswith("pipeline.ingestion") for name in review_imports)
+    assert not any(name.startswith("pipeline.indexing") for name in review_imports)
+
 
 def test_cloud_entrypoints_are_typed_redacted_only() -> None:
     analyze = inspect.signature(ClaudeClient.analyze)
+    review = inspect.signature(OpenAIReviewer.review)
     message = inspect.signature(build_user_message)
+    review_message = inspect.signature(build_review_user_message)
     assert "RedactedPayload" in str(analyze.parameters["redacted"].annotation)
+    assert "RedactedPayload" in str(review.parameters["redacted"].annotation)
     assert "RedactedPayload" in str(message.parameters["redacted"].annotation)
+    assert "RedactedPayload" in str(review_message.parameters["redacted"].annotation)
 
 
 def test_redacted_payload_constructor_is_source_local() -> None:

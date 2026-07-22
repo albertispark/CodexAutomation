@@ -15,6 +15,11 @@ from pipeline.cloud.claude_client import (
     CloudRefusalError,
     ComputedMetric,
 )
+from pipeline.cloud.openai_reviewer import (
+    PeerReviewResult,
+    ReviewIssue,
+    ReviewUsage,
+)
 from pipeline.extraction.bouncer import Bouncer
 from pipeline.extraction.schemas import ExtractionPayload, FinancialFigure, StatementType
 from pipeline.indexing.embedder import EMBED_DIM, Embedder
@@ -227,6 +232,123 @@ def test_cloud_cache_makes_immediate_rerun_zero_cloud_calls(
     assert FakeCloud.calls == 1
     assert FakeCloud.constructions == 1
     assert NoCallOllama.calls == []
+
+
+def test_openai_peer_review_corrects_before_workbook_and_is_cached(
+    settings, tmp_path: Path, monkeypatch
+) -> None:
+    source = _copy_csv(tmp_path, "reviewed.csv")
+    _write_bouncer_cache(source, settings)
+    settings.cloud.api_key = SecretStr("anthropic-test")
+    settings.review.enabled = True
+    settings.review.api_key = SecretStr("openai-test")
+    monkeypatch.setattr("pipeline.orchestrator.OllamaClient", NoCallOllama)
+
+    class FakeCloud:
+        calls = 0
+
+        def __init__(self, cfg):
+            self.last_payload_tokens = 100
+            self.last_cost_usd = 0.001
+
+        def analyze(self, *args, **kwargs):
+            type(self).calls += 1
+            return _analysis(), FakeUsage()
+
+    corrected = _analysis().model_copy(deep=True)
+    corrected.computed_metrics[0].value = 0.2
+
+    class FakeReviewer:
+        calls = 0
+
+        def __init__(self, cfg):
+            pass
+
+        def review(self, redacted, tasks, original):
+            type(self).calls += 1
+            return (
+                PeerReviewResult(
+                    verdict="corrected",
+                    issues=[
+                        ReviewIssue(
+                            severity="error",
+                            category="arithmetic",
+                            description="Corrected the metric value.",
+                            related_items=["Revenue Growth"],
+                            figure_ids=["F0001"],
+                        )
+                    ],
+                    reviewed_analysis=corrected,
+                ),
+                ReviewUsage(input_tokens=30, output_tokens=10),
+            )
+
+    monkeypatch.setattr("pipeline.orchestrator.ClaudeClient", FakeCloud)
+    monkeypatch.setattr("pipeline.orchestrator.OpenAIReviewer", FakeReviewer)
+
+    first = run_pipeline([source], settings, console=Console(file=None, quiet=True))[0]
+    second = run_pipeline([source], settings, console=Console(file=None, quiet=True))[0]
+
+    assert first.status == second.status == "success"
+    assert first.review_verdict == second.review_verdict == "corrected"
+    assert first.artifacts["review_json"].is_file()
+    assert first.artifacts["xlsx"].is_file()
+    review_artifact = json.loads(first.artifacts["review_json"].read_text())
+    assert review_artifact["reviewed_analysis"]["computed_metrics"][0]["value"] == 0.2
+    assert review_artifact["cache_hit"] is True
+    assert FakeCloud.calls == 1
+    assert FakeReviewer.calls == 1
+    assert first.token_usage.input_tokens == FakeUsage.input_tokens + 30
+
+
+def test_rejected_openai_review_quarantines_without_workbook(
+    settings, tmp_path: Path, monkeypatch
+) -> None:
+    source = _copy_csv(tmp_path, "rejected-review.csv")
+    _write_bouncer_cache(source, settings)
+    settings.cloud.api_key = SecretStr("anthropic-test")
+    settings.review.enabled = True
+    settings.review.api_key = SecretStr("openai-test")
+    monkeypatch.setattr("pipeline.orchestrator.OllamaClient", NoCallOllama)
+
+    class FakeCloud:
+        def __init__(self, cfg):
+            self.last_payload_tokens = 100
+            self.last_cost_usd = 0.001
+
+        def analyze(self, *args, **kwargs):
+            return _analysis(), FakeUsage()
+
+    class RejectingReviewer:
+        def __init__(self, cfg):
+            pass
+
+        def review(self, redacted, tasks, original):
+            return (
+                PeerReviewResult(
+                    verdict="rejected",
+                    issues=[
+                        ReviewIssue(
+                            severity="error",
+                            category="data_quality",
+                            description="Payload cannot support a reliable result.",
+                        )
+                    ],
+                    reviewed_analysis=original,
+                ),
+                ReviewUsage(input_tokens=20, output_tokens=5),
+            )
+
+    monkeypatch.setattr("pipeline.orchestrator.ClaudeClient", FakeCloud)
+    monkeypatch.setattr("pipeline.orchestrator.OpenAIReviewer", RejectingReviewer)
+    result = run_pipeline(
+        [source], settings, console=Console(file=None, quiet=True)
+    )[0]
+
+    assert result.status == "quarantined"
+    assert result.quarantine_reason == "openai_peer_review_rejected"
+    assert result.artifacts["review_json"].is_file()
+    assert "xlsx" not in result.artifacts
 
 
 def test_budget_exceeded_downgrades_all_remaining_files(

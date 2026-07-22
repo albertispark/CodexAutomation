@@ -3,8 +3,10 @@
 A local-first pipeline for extracting financial data from PDF, image, Excel,
 and CSV files. OCR, indexing, retrieval, extraction, and redaction run locally
 through Ollama. Only the compact redacted payload—without source snippets—is
-eligible for Claude analysis. The final deliverable is a formatted workbook
-with a local audit trail.
+eligible for cloud processing. Claude creates the analysis, then an independent
+OpenAI model recomputes and peer-reviews that structured answer before the
+pipeline can write a workbook. The final deliverable includes a formatted
+workbook and local audit trail.
 
 ## Prerequisites
 
@@ -36,14 +38,23 @@ not affect the Ollama server.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-cp .env.example .env
+cp .env.example .env.local
 pipeline doctor
 ```
 
 With `uv`, the equivalent editable install is `uv pip install -e '.[dev]'`.
 
-Set `ANTHROPIC_API_KEY` in `.env` for the cloud stage. `--no-cloud` and
-`--dry-run` work without an API key.
+Set `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` in `.env.local`. The file is
+gitignored and takes priority over a shared `.env`; existing shell environment
+variables still take highest priority. Never paste keys into YAML or commit
+them. `--no-cloud` and `--dry-run` work without either API key.
+
+Peer review is enabled in `config/settings.yaml` and currently uses
+`gpt-5.6-sol` with medium reasoning. Set `review.enabled: false` to run the
+legacy Claude-only path. When enabled, a review must be approved or corrected
+before Excel output is allowed; a rejection is quarantined. Review records are
+written under `outputs/reviews/`, and identical review requests are cached
+under `cache/review/`.
 
 ## Usage
 
@@ -60,9 +71,15 @@ pipeline doctor
 ```
 
 When `redaction.enabled` is false, `pipeline run` requires the explicit
-`--allow-unredacted` consent flag. Confirm your organization's Anthropic data
-retention posture, including any zero-data-retention agreement, before using
-the cloud stage in production.
+`--allow-unredacted` consent flag. OpenAI receives only the redacted payload and
+Claude's structured analysis, not the original file, filename, or source
+snippets; review requests also set `store=false`. Confirm your organization's
+Anthropic and OpenAI data-retention posture before using cloud stages in
+production.
+
+The CLI token total and audit log include OpenAI review usage. The displayed
+cost estimate remains the Anthropic budget-ledger amount; check the OpenAI
+usage dashboard for reviewer charges rather than relying on a hardcoded price.
 
 Exit codes are `0` for success, `1` for a file-level failure or quarantine,
 and `2` for an environment/configuration failure.
@@ -74,6 +91,6 @@ pytest -q
 OLLAMA_ITESTS=1 pytest tests/test_integration_local.py -q -s
 ```
 
-The normal suite never contacts Anthropic. The optional
+The normal suite never contacts Anthropic or OpenAI. The optional
 `ANTHROPIC_ITESTS=1 pytest tests/test_claude_client.py -q` run makes only the
 explicit `count_tokens` cache-floor check and requires `ANTHROPIC_API_KEY`.
